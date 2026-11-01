@@ -1,0 +1,12 @@
+{
+  "name": "footprint",
+  "version": "0.1.0",
+  "description": "A pane with the tree of files this session created, modified or deleted.",
+  "author": {
+    "name": "Ahmet Bilgili"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "homepage": "https://github.com/bilgili/footprint",
+  "repository": "https://github.com/bilgili/footprint"
+}

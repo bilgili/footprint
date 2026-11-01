@@ -1,0 +1,14 @@
+{
+  "name": "footprint",
+  "owner": {
+    "name": "Ahmet Bilgili"
+  },
+  "plugins": [
+    {
+      "name": "footprint",
+      "source": "./",
+      "description": "A pane with the tree of files this session created, modified or deleted."
+    }
+  ],
+  "description": "Footprint: a pane with the tree of files the current Claude Code session created, modified or deleted."
+}
