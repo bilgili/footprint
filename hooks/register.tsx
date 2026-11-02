@@ -408,8 +408,10 @@ export const register: Register = on => {
         if ('d' in it) {
           const [name, d] = it.d!
           const isOpen = expanded.has(d.path)
+          // Only the row that shows a change flashes: an open folder's children are on screen, so it stays quiet;
+          // a collapsed folder is the first visible parent of what changed below it.
           const row = (
-            <Box key={'rd:' + d.path} flexDirection="row" overflow="hidden" backgroundColor={flash(d.last)}>
+            <Box key={'rd:' + d.path} flexDirection="row" overflow="hidden" backgroundColor={isOpen ? undefined : flash(d.last)}>
               {fixed(lead(more, isLast, { open: isOpen, path: d.path }))}
               <Box flexShrink={1} minWidth={0}>
                 <Button plain key={'n:' + d.path} onPress={() => toggle(d.path)}>
@@ -449,13 +451,20 @@ export const register: Register = on => {
           </Box>,
         ]
       })
-      if (hidden > 0)
+      if (hidden > 0) {
+        // The "… more" row stands in for the rows it hides, so it shows (flashes) their newest change.
+        const last = items.slice(MAX_ROWS).reduce<Mark['last']>(
+          (acc, it) =>
+            latest(acc, 'd' in it ? it.d![1].last : it.f!.mark.last && { at: it.f!.mark.last.at, change: it.f!.st }),
+          undefined,
+        )
         out.push(
-          <Box key={'rm:' + n.path} flexDirection="row">
+          <Box key={'rm:' + n.path} flexDirection="row" backgroundColor={flash(last)}>
             {fixed(lead(more, true))}
             <Text dimColor> … {hidden} more</Text>
           </Box>,
         )
+      }
       return out
     }
 

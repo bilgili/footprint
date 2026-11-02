@@ -20,7 +20,7 @@ Answer `y` to add the marketplace, then pick a scope. The pane opens with the ne
 
 One tree from the filesystem root, one folder row per path segment, every folder collapsed until you press it. Drawn guide lines and a boxed `+`/`-` before each folder on the desktop app, VS Code and mobile; plain indent in the terminal.
 
-File names are colored by status: green for added, blue for modified, red and struck through for deleted. Long names are cut in the middle. A file the session created and then removed is hidden. When a file changes, its row and every parent folder row flash in that color and fade within 3 seconds, so a change shows even inside a collapsed folder. A press on an added or modified file opens it in the desktop app's file pane.
+File names are colored by status: green for added, blue for modified, red and struck through for deleted. Long names are cut in the middle. A file the session created and then removed is hidden. When a file changes, the row that shows it flashes in its color and fades within 3 seconds: the file itself when it is visible, else its first collapsed parent folder. A press on an added or modified file opens it in the desktop app's file pane.
 
 ## How it works
 

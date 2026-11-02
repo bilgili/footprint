@@ -72,16 +72,21 @@ test('folders start collapsed and a press toggles them', async ($, on) => {
   await ui.unmount()
 })
 
-test('a change flashes the file row and every parent row', async ($, on) => {
+test('a change flashes only the row that shows it: the file, or its first collapsed parent', async ($, on) => {
   engine(on, { exists: [false, true], list: [] })
   await $.tool.call({ tool: 'Write', file_path: '/r/src/a.ts', content: 'x' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const bg = async (key: string) => (await ui.find({ type: 'Box', key }))?.props.backgroundColor
-  // added = amber, at full strength right after the change; the collapsed parent flashes too.
+  // All collapsed: /r is the first visible parent, so it flashes (added = green).
   expect(await bg('rd:/r')).toMatch(/^#3FB950/)
-  await expand(ui, '/r', '/r/src')
+  // /r open, /r/src collapsed: /r goes quiet, /r/src flashes.
+  await expand(ui, '/r')
+  expect(await bg('rd:/r')).toBe(undefined)
   expect(await bg('rd:/r/src')).toMatch(/^#3FB950/)
+  // Everything open: only the file row flashes.
+  await expand(ui, '/r/src')
+  expect(await bg('rd:/r/src')).toBe(undefined)
   expect(await bg('rf:/r/src/a.ts')).toMatch(/^#3FB950/)
   await ui.unmount()
 })
