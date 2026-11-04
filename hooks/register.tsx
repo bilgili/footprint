@@ -217,6 +217,10 @@ async function diff($: Engine, before: Snap, after: Snap, known: string[], root:
 // ---- hooks -----------------------------------------------------------------
 
 export const register: Register = on => {
+  /** Folders outside the working directory that the user already granted to the session. */
+  const granted = new Set<string>()
+  /** Grant requests the user has not answered yet, by folder. */
+  const asking = new Map<string, Promise<boolean>>()
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'footprint', description: 'Show the files this session touched' })
     // The terminal opens a pane inline on its main screen; there /footprint opens it on demand.
@@ -277,8 +281,9 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
-    // Svg draws real guide lines; the terminal has no Svg and gets plain indent.
-    const Svg = 'Svg' in els ? els.Svg : undefined
+    // Svg draws real guide lines; the terminal has no Svg and gets glyph guides. Test the surface, not
+    // `'Svg' in els`: the terminal's table answers an unknown element too, as a fragment that draws nothing.
+    const Svg = ['desktop', 'vscode', 'mobile'].includes(e.surface) && 'Svg' in els ? els.Svg : undefined
     const l = await read($, ledger)
     const expanded = new Set((await read($, view)).expanded)
     const cwd0 = await $.session.cwd()
@@ -331,7 +336,27 @@ export const register: Register = on => {
       void update($, view, v => ({
         expanded: v.expanded.includes(dir) ? v.expanded.filter(d => d !== dir) : [...v.expanded, dir],
       }))
-    const open = (path: string) => void $.mcp.call('ccd_view', 'show_pane', { pane: 'file', path }).catch(() => undefined)
+    // The file pane opens only paths inside the session's folders. A file outside the working directory
+    // first gets its folder granted (the user approves the request); a grant covers the folders below it.
+    const open = (path: string) =>
+      void (async () => {
+        if (!under(path, cwd, sep) && ![...granted].some(g => under(path, g, sep))) {
+          const dir = parent(path, sep)
+          // One request per folder at a time: a second press while the user decides joins the first.
+          let ask = asking.get(dir)
+          if (!ask) {
+            // A declined request comes back as isError, not a throw: nothing opens, and the next press asks again.
+            ask = $.mcp.call('ccd_directory', 'request_directory', { path: dir })
+              .then(r => !r.isError)
+              .finally(() => asking.delete(dir))
+            asking.set(dir, ask)
+          }
+          if (!(await ask)) return
+          granted.add(dir)
+        }
+        // A grant the app no longer honours (revoked) fails here: forget them all and ask again next press.
+        if ((await $.mcp.call('ccd_view', 'show_pane', { pane: 'file', path })).isError) granted.clear()
+      })().catch(() => undefined)
 
     // One row's guide lines: `more[i]` says whether the ancestor at depth i+1 has a sibling below it.
     const STEP = 18
@@ -364,13 +389,21 @@ export const register: Register = on => {
     // an absolute Box anchored to the Svg's right edge (where the box is), holding one em space.
     const lead = (more: boolean[], isLast: boolean, dir?: { open: boolean; path: string }) => {
       if (!Svg) {
-        const pad = <Text>{'  '.repeat(more.length)}</Text>
-        if (!dir) return pad
+        // The terminal drops a Text of spaces alone, so indent is fixed-width Boxes holding the same
+        // guide lines as the Svg: column j carries `│` when more[j + 1], the last column the branch.
+        const d = more.length
+        const cell = (k: string, glyph?: string) => (
+          <Box key={k} width={2} flexShrink={0}>
+            {glyph && <Text dimColor>{glyph}</Text>}
+          </Box>
+        )
         return (
           <Box flexDirection="row">
-            {pad}
-            <Button plain key={'d:' + dir.path} onPress={() => toggle(dir.path)}>{dir.open ? '-' : '+'}</Button>
-            <Text> </Text>
+            {more.slice(1).map((m, j) => cell('g' + j, m ? '│' : undefined))}
+            {d > 0 && cell('b', isLast ? '└─' : '├─')}
+            {/* A file's branch runs on where a folder's +/- sits, so file and folder names line up. */}
+            {!dir && cell('f', d > 0 ? '──' : undefined)}
+            {dir && <Button plain key={'d:' + dir.path} onPress={() => toggle(dir.path)}>{dir.open ? '-' : '+'}</Button>}
           </Box>
         )
       }
@@ -433,8 +466,11 @@ export const register: Register = on => {
             {f.name}
           </Text>
         )
-        // ccd_view opens only files under the working directory, and only on the desktop.
-        const canOpen = e.surface === 'desktop' && f.st !== 'deleted' && under(f.path, cwd, sep)
+        // ccd_view opens files only on the desktop; `open` grants a folder outside the working directory first,
+        // but never a filesystem root (`/`, `C:`): one approval there would hand over the whole disk.
+        const dir = parent(f.path, sep)
+        const canOpen =
+          e.surface === 'desktop' && f.st !== 'deleted' && (under(f.path, cwd, sep) || !(dir === sep || /^[A-Za-z]:$/.test(dir)))
         return [
           <Box key={'rf:' + f.path} flexDirection="row" overflow="hidden" backgroundColor={bg}>
             {fixed(lead(more, isLast))}

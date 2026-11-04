@@ -184,6 +184,25 @@ test('on the terminal a file row is text, not a press', async ($, on) => {
   await expand(ui, '/r')
   expect(await ui.find({ type: 'Button', key: 'f:/r/a.ts' })).toBe(undefined)
   expect((await ui.find({ type: 'Text', text: /a\.ts/ }))?.text).toBe('a.ts')
+  // Indent is drawn guide glyphs, not a Text of spaces the terminal drops.
+  expect((await ui.find({ type: 'Text', text: '└─' }))?.text).toBe('└─')
+  await ui.unmount()
+})
+
+test('on the terminal the guides follow the tree: ├─ for a sibling below, │ under it, └─ for the last', async ($, on) => {
+  engine(on, { exists: [false, true, false, true], list: [] })
+  await $.tool.call({ tool: 'Write', file_path: '/r/x/a.ts', content: 'x' })
+  await $.tool.call({ tool: 'Write', file_path: '/r/y/b.ts', content: 'x' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await expand(ui, '/r', '/r/x')
+  // Rows: r · ├─ x · │ └─── a.ts · └─ y
+  expect(await ui.findAll({ type: 'Text', text: '├─' })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: '│' })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: '└─' })).toHaveLength(2)
+  expect(await ui.findAll({ type: 'Text', text: '──' })).toHaveLength(1)
+  expect((await ui.find({ type: 'Button', key: 'd:/r/x' }))?.text).toBe('-')
+  expect((await ui.find({ type: 'Button', key: 'd:/r/y' }))?.text).toBe('+')
   await ui.unmount()
 })
 
@@ -271,6 +290,59 @@ test('a settled name is coloured by status: green added, blue modified, red stru
   // Only openable rows get the invisible press overlay; a deleted file has none.
   expect(await ui.find({ type: 'Button', key: 'f:/r/new.txt' })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: 'f:/r/gone.txt' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a press outside the working directory grants the folder, then opens; never a root, never twice', async ($, on) => {
+  const calls: string[] = []
+  let declined = false
+  let gate: Promise<void> = Promise.resolve()
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.cwd', () => ({ value: '/r' }))
+  let t = 0
+  on('clock.now', () => ({ value: (t += 10000) }))
+  let n = 0
+  on('fs.exists', () => ({ value: n++ % 2 === 1 }))
+  on('tool.call', () => ({ result: {} }))
+  on('mcp.call', async (_, e) => {
+    calls.push(`${e.server}.${e.tool}:${e.args.path}`)
+    if (e.tool === 'request_directory') await gate
+    return { value: { content: [], isError: declined && e.tool === 'request_directory' } }
+  })
+  for (const f of ['/r/in.txt', '/tmp/o/a.txt', '/tmp/o/b.txt', '/tmp/o/sub/c.txt', '/top.txt'])
+    await $.tool.call({ tool: 'Write', file_path: f, content: 'x' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await expand(ui, '/r', '/tmp', '/tmp/o', '/tmp/o/sub')
+  // A file directly under the filesystem root has no press target: granting `/` would grant the disk.
+  expect(await ui.find({ type: 'Button', key: 'f:/top.txt' })).toBe(undefined)
+  // A file inside the working directory needs no grant.
+  await ui.press({ key: 'f:/r/in.txt' })
+  expect(calls).toEqual(['ccd_view.show_pane:/r/in.txt'])
+  calls.length = 0
+
+  // A declined grant opens nothing, and the next press asks again.
+  declined = true
+  await ui.press({ key: 'f:/tmp/o/a.txt' })
+  expect(calls).toEqual(['ccd_directory.request_directory:/tmp/o'])
+  calls.length = 0
+  declined = false
+
+  // Two presses while the user is still deciding make one request.
+  let release!: () => void
+  gate = new Promise(r => (release = r))
+  const first = ui.press({ key: 'f:/tmp/o/a.txt' })
+  const second = ui.press({ key: 'f:/tmp/o/b.txt' })
+  release()
+  await Promise.all([first, second])
+  // A folder below a granted one is covered.
+  await ui.press({ key: 'f:/tmp/o/sub/c.txt' })
+  expect(calls.filter(c => c.startsWith('ccd_directory'))).toEqual(['ccd_directory.request_directory:/tmp/o'])
+  expect(calls.filter(c => c.startsWith('ccd_view')).sort()).toEqual([
+    'ccd_view.show_pane:/tmp/o/a.txt',
+    'ccd_view.show_pane:/tmp/o/b.txt',
+    'ccd_view.show_pane:/tmp/o/sub/c.txt',
+  ])
   await ui.unmount()
 })
 
