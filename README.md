@@ -2,9 +2,9 @@
 
 Footprint is a mod for Claude Code. It adds a pane with two sections. The Files section shows the tree of files the current session created, modified or deleted. It shows only those files, not the whole tree. The Runs section lists the commands that the session executed, grouped by program.
 
-![The Footprint pane with demo data: a collapsible tree of the files one session added, modified and deleted, with a blue flash running up from the file that just changed](docs/footprint-pane.png)
+![The Footprint pane with demo data: a Files section with the collapsible tree of the files one session added, modified and deleted, and a Runs section with the commands that the session ran, grouped by program. A blue flash marks the file that just changed.](docs/footprint-pane.png)
 
-*Demo data: the pane's real render output for a sample project, `/workspace/acme-shop`.*
+*Demo data: the pane's real render output for a sample project, `/workspace/acme-shop`. The Runs section shows the `npm` group open, with one failed run and its output.*
 
 ## Install
 
@@ -55,7 +55,6 @@ A separate log feeds the Runs section. A hook wraps each `Bash` call and each `M
 - The log removes escape sequences and control characters from the command and the output. A progress bar that rewrites one line shows as one line of joined text.
 - A command that a subagent runs has a run too.
 - A command keeps its first 2000 characters. The program name comes from a word scan, not a shell parser: `bash -c "git push"` groups as `bash`, and `xargs git` groups as `xargs`.
-- The `docs/footprint-pane.png` picture shows the pane from before the Files and Runs headers.
 - A mod reload during a command loses that run.
 
 ## Develop
