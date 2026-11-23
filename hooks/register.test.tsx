@@ -1,5 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { FsEntry, On } from 'claude-code'
+import { clean, fmtMs, groupRuns, programOf, statusOf, tailOf } from './register'
+import type { Run } from '../types'
 
 const PANE = {
   plugin: 'footprint',
@@ -19,7 +21,11 @@ const F = (name: string, size = 1): FsEntry => ({ name, kind: 'file', size, mtim
 
 // Nothing sits beneath the plugin: each hook here stands for the engine.
 // `list` answers each fs.list in order; `lists` counts the calls.
-function engine(on: On, fs: { exists: boolean[]; list: FsEntry[][]; root?: string; lists?: { n: number } }) {
+// `call` answers each tool call (default `{ result: {} }`): a test scripts ok, failed, background or denied.
+function engine(
+  on: On,
+  fs: { exists: boolean[]; list: FsEntry[][]; root?: string; lists?: { n: number }; call?: (e: any) => object },
+) {
   let t = 0
   on('command.register', () => ({ value: { command: 'footprint' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -31,7 +37,7 @@ function engine(on: On, fs: { exists: boolean[]; list: FsEntry[][]; root?: strin
     if (fs.lists) fs.lists.n++
     return { value: fs.list.shift() ?? [] }
   })
-  on('tool.call', () => ({ result: {} }))
+  on('tool.call', (_, e) => (fs.call ? fs.call(e) : { result: {} }) as any)
 }
 
 type Ui = { press: (t: { key: string }) => Promise<unknown> }
@@ -196,10 +202,10 @@ test('on the terminal the guides follow the tree: ├─ for a sibling below, �
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await expand(ui, '/r', '/r/x')
-  // Rows: r · ├─ x · │ └─── a.ts · └─ y
+  // Rows: Files · └─ r · ├─ x · │ └─── a.ts · └─ y  (the tree hangs one level under the Files header)
   expect(await ui.findAll({ type: 'Text', text: '├─' })).toHaveLength(1)
   expect(await ui.findAll({ type: 'Text', text: '│' })).toHaveLength(1)
-  expect(await ui.findAll({ type: 'Text', text: '└─' })).toHaveLength(2)
+  expect(await ui.findAll({ type: 'Text', text: '└─' })).toHaveLength(3)
   expect(await ui.findAll({ type: 'Text', text: '──' })).toHaveLength(1)
   expect((await ui.find({ type: 'Button', key: 'd:/r/x' }))?.text).toBe('-')
   expect((await ui.find({ type: 'Button', key: 'd:/r/y' }))?.text).toBe('+')
@@ -369,4 +375,350 @@ test('an empty ledger says so', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /touched/ }))?.text).toBe('No files touched yet.')
   await ui.unmount()
+})
+
+// ---- Files header and Runs section -----------------------------------------
+
+const OK = (stdout = '') => ({ result: { stdout, stderr: '', interrupted: false }, text: stdout })
+const FAIL = (text: string) => ({ result: text, text, isError: true as const })
+
+test('the Files header counts the files, closes the tree, and flashes while closed', async ($, on) => {
+  engine(on, { exists: [false, true], list: [] })
+  await $.tool.call({ tool: 'Write', file_path: '/r/a.ts', content: 'x' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'sec:files' }))?.text).toMatch(/^\s*Files\s+1$/)
+  await expand(ui, '/r')
+  expect(await ui.find({ type: 'Button', key: 'f:/r/a.ts' })).toBeDefined()
+  await ui.press({ key: 'sec:files' })
+  expect(await ui.find({ type: 'Button', key: 'd:/r' })).toBe(undefined)
+  expect((await ui.find({ type: 'Box', key: 'sh:files' }))?.props.backgroundColor).toMatch(/^#3FB950/)
+  await ui.press({ key: 'sec:files' })
+  // The folder the user opened stays open.
+  expect(await ui.find({ type: 'Button', key: 'f:/r/a.ts' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an empty ledger still draws the Files header with a zero count', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK() })
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'sec:files' }))?.text).toMatch(/^\s*Files\s+0$/)
+  expect((await ui.find({ type: 'Text', text: /touched/ }))?.text).toBe('No files touched yet.')
+  expect((await ui.find({ type: 'Button', key: 'sec:runs' }))?.text).toMatch(/^\s*Runs\s+1$/)
+  await ui.unmount()
+})
+
+test('a session with no command draws no Runs section', async ($, on) => {
+  engine(on, { exists: [false, true], list: [] })
+  await $.tool.call({ tool: 'Write', file_path: '/r/a.ts', content: 'x' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', key: 'sec:runs' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('commands are logged, grouped by program, and a group opens to the full command lines', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK() })
+  const multi = 'git commit -m "Draw it\n\nGroup runs."'
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+  await $.tool.call({ tool: 'Bash', command: multi })
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'sec:runs' }))?.text).toMatch(/^\s*Runs\s+3$/)
+  // Closed by default: no group row.
+  expect(await ui.find({ type: 'Button', key: 'rg:git' })).toBe(undefined)
+  await ui.press({ key: 'sec:runs' })
+  expect((await ui.find({ type: 'Button', key: 'rg:git' }))?.text).toMatch(/^\s*git\s+2$/)
+  expect((await ui.find({ type: 'Button', key: 'rg:npm' }))?.text).toMatch(/^\s*npm\s+1$/)
+  // Every group starts closed.
+  expect(await ui.find({ type: 'Text', text: 'git status' })).toBe(undefined)
+  await ui.press({ key: 'rg:git' })
+  expect((await ui.find({ type: 'Text', text: 'git status' }))?.text).toBe('git status')
+  // The whole command, line breaks kept.
+  expect((await ui.find({ type: 'Text', text: multi }))?.text).toBe(multi)
+  await ui.press({ key: 'rg:git' })
+  expect(await ui.find({ type: 'Text', text: 'git status' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a failed command counts in the header and marks its group; its output opens on a press', async ($, on) => {
+  engine(on, {
+    exists: [],
+    list: [],
+    call: e => (e.command === 'npm test' ? FAIL('FAIL a.test.ts\nExit code 1') : OK('fine')),
+  })
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'sec:runs' }))?.text).toMatch(/^\s*Runs\s+2\s+·\s+1 failed$/)
+  await ui.press({ key: 'sec:runs' })
+  expect((await ui.find({ type: 'Button', key: 'rg:npm' }))?.text).toContain('✕')
+  expect((await ui.find({ type: 'Button', key: 'rg:git' }))?.text).not.toContain('✕')
+  await ui.press({ key: 'rg:npm' })
+  expect(await ui.find({ type: 'Box', key: 'rt:0' })).toBe(undefined)
+  await ui.press({ key: 'rr:0' })
+  expect((await ui.find({ type: 'Text', text: /Exit code 1/ }))?.text).toContain('Exit code 1')
+  await ui.press({ key: 'rr:0' })
+  expect(await ui.find({ type: 'Box', key: 'rt:0' })).toBe(undefined)
+  // `git status` returned output "fine" too, but that group is closed: nothing to press yet.
+  await ui.unmount()
+})
+
+test('a run with no output has no press target', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK() })
+  await $.tool.call({ tool: 'Bash', command: 'true' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:true' })
+  expect((await ui.find({ type: 'Text', text: /^true$/ }))?.text).toBe('true')
+  expect(await ui.find({ type: 'Button', key: 'rr:0' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('background and Monitor runs show background; denied, command-less and non-command calls leave no run', async ($, on) => {
+  engine(on, {
+    exists: [false, true],
+    list: [],
+    call: e =>
+      e.tool === 'Monitor'
+        ? { result: { taskId: 't', timeoutMs: 0 }, text: 'started' }
+        : e.command === 'blocked'
+          ? { deny: 'no' }
+          : e.command?.startsWith('sleep')
+            ? { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b1' }, text: '' }
+            : { result: {} },
+  })
+  await $.tool.call({ tool: 'Bash', command: 'sleep 9', run_in_background: true })
+  await $.tool.call({ tool: 'Monitor', command: 'tail -f app.log' } as any)
+  await $.tool.call({ tool: 'Monitor', ws: 'wss://example.test' } as any)
+  await $.tool.call({ tool: 'Bash', command: 'blocked' })
+  await $.tool.call({ tool: 'Write', file_path: '/r/a.ts', content: 'x' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'sec:runs' }))?.text).toMatch(/^\s*Runs\s+2$/)
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:sleep' })
+  await ui.press({ key: 'rg:tail' })
+  // Each background run shows `background` where a duration would be.
+  expect(await ui.findAll({ type: 'Text', text: 'background' })).toHaveLength(2)
+  // `text` only says the call started: neither run has output to show, so neither takes a press.
+  expect(await ui.find({ type: 'Button', key: 'rr:0' })).toBe(undefined)
+  expect(await ui.find({ type: 'Button', key: 'rr:1' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a command is cut at 2000 characters; an output keeps its last 1000', async ($, on) => {
+  const long = 'echo ' + 'a'.repeat(2495)
+  engine(on, { exists: [], list: [], call: () => OK('z'.repeat(4500) + 'LAST') })
+  await $.tool.call({ tool: 'Bash', command: long })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:echo' })
+  const cmd = (await ui.find({ type: 'Text', text: /^echo a+…$/ }))?.text as string
+  expect(cmd).toHaveLength(2000)
+  await ui.press({ key: 'rr:0' })
+  const tail = (await ui.find({ type: 'Text', text: /^z+LAST$/ }))?.text as string
+  expect(tail).toHaveLength(1000)
+  await ui.unmount()
+})
+
+test('the log keeps the newest 100 runs', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK() })
+  for (let i = 0; i <= 100; i++) await $.tool.call({ tool: 'Bash', command: `echo ${i}` })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'sec:runs' }))?.text).toMatch(/^\s*Runs\s+100$/)
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:echo' })
+  expect(await ui.find({ type: 'Text', text: 'echo 0' })).toBe(undefined)
+  expect((await ui.find({ type: 'Text', text: /^echo 1$/ }))?.text).toBe('echo 1')
+  expect((await ui.find({ type: 'Text', text: /^echo 100$/ }))?.text).toBe('echo 100')
+  await ui.unmount()
+})
+
+test('two calls that end together get two ids', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK() })
+  await Promise.all([$.tool.call({ tool: 'Bash', command: 'alpha 1' }), $.tool.call({ tool: 'Bash', command: 'beta 2' })])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:alpha' })
+  await ui.press({ key: 'rg:beta' })
+  expect(await ui.find({ type: 'Box', key: 'rre:0' })).toBeDefined()
+  expect(await ui.find({ type: 'Box', key: 'rre:1' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a folder press keeps Runs open, and a section press keeps the folders open', async ($, on) => {
+  // The Bash walk lists a.ts before and after, so the ledger keeps it.
+  engine(on, { exists: [false, true], list: [[F('a.ts')], [F('a.ts')]], call: e => (e.tool === 'Write' ? { result: {} } : OK()) })
+  await $.tool.call({ tool: 'Write', file_path: '/r/a.ts', content: 'x' })
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await expand(ui, '/r')
+  expect(await ui.find({ type: 'Button', key: 'rg:git' })).toBeDefined()
+  await ui.press({ key: 'sec:files' })
+  await ui.press({ key: 'sec:files' })
+  expect(await ui.find({ type: 'Button', key: 'f:/r/a.ts' })).toBeDefined()
+  // Closing and opening Runs leaves the open folder alone.
+  await ui.press({ key: 'sec:runs' })
+  expect(await ui.find({ type: 'Button', key: 'rg:git' })).toBe(undefined)
+  await ui.press({ key: 'sec:runs' })
+  expect(await ui.find({ type: 'Button', key: 'rg:git' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'f:/r/a.ts' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('on the terminal the Runs section has the same rows and presses', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK('out') })
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:git' })
+  expect((await ui.find({ type: 'Text', text: 'git status' }))?.text).toBe('git status')
+  // The press on the mark shows the output, as on the desktop.
+  expect(await ui.find({ type: 'Box', key: 'rt:0' })).toBe(undefined)
+  await ui.press({ key: 'rr:0' })
+  expect(await ui.find({ type: 'Box', key: 'rt:0' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the command is plain Text on the desktop: the press sits on the mark, not on the command', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK('out') })
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:git' })
+  const cmd = await ui.find({ type: 'Text', text: /^git status$/ })
+  expect(cmd?.props.mono).toBe(true)
+  // The Button over the mark holds no command text.
+  expect((await ui.find({ type: 'Button', key: 'rr:0' }))?.text?.includes('git')).toBe(false)
+  await ui.unmount()
+})
+
+test('groups and runs draw newest first', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => OK() })
+  await $.tool.call({ tool: 'Bash', command: 'git a' })
+  await $.tool.call({ tool: 'Bash', command: 'npm b' })
+  await $.tool.call({ tool: 'Bash', command: 'git c' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:git' })
+  await ui.press({ key: 'rg:npm' })
+  const keys = (await ui.findAll({ type: 'Box' }))
+    .map(b => b.key as string | undefined)
+    .filter(k => k?.startsWith('rgr:') || k?.startsWith('rre:'))
+  expect(keys).toEqual(['rgr:git', 'rre:2', 'rre:0', 'rgr:npm', 'rre:1'])
+  await ui.unmount()
+})
+
+test('a command the user rejects shows failed, with the reject text as output', async ($, on) => {
+  engine(on, { exists: [], list: [], call: () => FAIL("The user doesn't want to proceed with this tool use.") })
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf x' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'sec:runs' }))?.text).toMatch(/Runs\s+1\s+·\s+1 failed/)
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:rm' })
+  await ui.press({ key: 'rr:0' })
+  expect((await ui.find({ type: 'Text', text: /doesn't want to proceed/ }))?.text).toContain("doesn't want")
+  await ui.unmount()
+})
+
+test('output is cleaned: no carriage returns, no hyperlink escapes', async ($, on) => {
+  engine(on, {
+    exists: [],
+    list: [],
+    call: e => (e.command === 'progress' ? OK('10%\r50%\r100%') : OK('\x1b]8;;https://x.test\x07link\x1b]8;;\x07')),
+  })
+  await $.tool.call({ tool: 'Bash', command: 'progress' })
+  await $.tool.call({ tool: 'Bash', command: 'links' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:progress' })
+  await ui.press({ key: 'rg:links' })
+  await ui.press({ key: 'rr:0' })
+  await ui.press({ key: 'rr:1' })
+  expect((await ui.find({ type: 'Text', text: /^10%50%100%$/ }))?.text).toBe('10%50%100%')
+  expect((await ui.find({ type: 'Text', text: /^link$/ }))?.text).toBe('link')
+  await ui.unmount()
+})
+
+test('the untracked-Bash notice shows while the Files section is closed', async ($, on) => {
+  // 20001 files in the root: the before-walk gives up, and the pane says Bash changes are not tracked.
+  const many = Array.from({ length: 20001 }, (_, i) => F(`f${i}`))
+  engine(on, { exists: [], list: [many], call: () => OK() })
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /not tracked/ })).toBeDefined()
+  await ui.press({ key: 'sec:files' })
+  expect(await ui.find({ type: 'Text', text: /not tracked/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('programOf skips directory prefixes, assignments and wrappers, and names the program', () => {
+  expect(programOf('git status')).toBe('git')
+  expect(programOf('CI=1 sudo npm test')).toBe('npm')
+  expect(programOf('sudo -E npm test')).toBe('npm')
+  expect(programOf('cd app && pnpm build')).toBe('pnpm')
+  expect(programOf('cd app; env FOO=1 make')).toBe('make')
+  expect(programOf('/usr/bin/git log')).toBe('git')
+  expect(programOf('')).toBe('other')
+  expect(programOf('   ')).toBe('other')
+  expect(programOf('sudo')).toBe('other')
+})
+
+test('programOf: wrapper value flags, quoted paths and values, parentheses and comment lines', () => {
+  expect(programOf('sudo -u root npm test')).toBe('npm')
+  expect(programOf('nice -n 10 make')).toBe('make')
+  expect(programOf('env -u HOME make')).toBe('make')
+  expect(programOf('env -i X=1 make')).toBe('make')
+  expect(programOf('time -p ls')).toBe('ls')
+  expect(programOf('cd "my dir" && git status')).toBe('git')
+  expect(programOf('FOO="a b" make')).toBe('make')
+  expect(programOf('(cd app && make)')).toBe('make')
+  expect(programOf('# build\nmake')).toBe('make')
+})
+
+test('clean drops escapes, OSC links and control characters; fmtMs never rounds up to 60s or goes negative', () => {
+  expect(clean('10%\r50%\r100%')).toBe('10%50%100%')
+  expect(clean('a\r\nb\tc')).toBe('a\nb\tc')
+  expect(clean('\x1b]8;;https://x.test\x07link\x1b]8;;\x07')).toBe('link')
+  expect(clean('\x1b[31mred\x1b[0m\x9b')).toBe('red')
+  expect(fmtMs(59_950)).toBe('59.9s')
+  expect(fmtMs(-5)).toBe('0.0s')
+  expect(fmtMs(65_000)).toBe('1m 05s')
+})
+
+test('groupRuns sorts groups and runs newest first and reports the worst status', () => {
+  const run = (id: number, command: string, at: number, status: Run['status'] = 'ok'): Run => ({
+    id, tool: 'Bash', command, at, ms: 1, status,
+  })
+  const g = groupRuns([
+    run(0, 'git status', 1),
+    run(1, 'npm test', 2, 'failed'),
+    run(2, 'git log', 3, 'background'),
+    run(3, 'git push', 3, 'failed'),
+  ])
+  expect(g.map(x => x.name)).toEqual(['git', 'npm'])
+  expect(g[0]!.runs.map(r => r.id)).toEqual([3, 2, 0])
+  expect(g[0]!.worst).toBe('failed')
+  expect(groupRuns([run(0, 'ls', 1)])[0]!.worst).toBe(undefined)
+})
+
+test('statusOf: abort beats error beats background beats interrupted; typed fields count only without an error', () => {
+  expect(statusOf('Bash', { result: {} }, true)).toBe('interrupted')
+  expect(statusOf('Bash', { isError: true, result: 'boom' }, false)).toBe('failed')
+  expect(statusOf('Bash', { result: { backgroundTaskId: 'b' } }, false)).toBe('background')
+  expect(statusOf('Monitor', { result: { taskId: 't' } }, false)).toBe('background')
+  expect(statusOf('Bash', { result: { interrupted: true } }, false)).toBe('interrupted')
+  expect(statusOf('Bash', { result: { stdout: 'x', interrupted: false } }, false)).toBe('ok')
+})
+
+test('tailOf takes the model-read text, strips escapes and control characters, keeps the last 1000', () => {
+  expect(tailOf({ text: '\x1b[31mred\x1b[0m\x07 ok\n' })).toBe('red ok')
+  expect(tailOf({ result: 'Exit code 2' })).toBe('Exit code 2')
+  expect(tailOf({ text: '' })).toBe(undefined)
+  expect(tailOf({ text: 'a'.repeat(1500) + 'END' })).toHaveLength(1000)
 })

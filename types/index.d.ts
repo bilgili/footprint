@@ -31,8 +31,31 @@ export type Observation = {
 /** Pane state: folders the user opened, as canonical paths. Every other folder is collapsed. */
 export type View = { expanded: string[] }
 
+export type RunStatus = 'ok' | 'failed' | 'interrupted' | 'background'
+
+/** One executed shell command. `at` is the start time, `ms` the wall time of the call. */
+export type Run = {
+  id: number
+  tool: 'Bash' | 'Monitor'
+  command: string
+  at: number
+  ms: number
+  status: RunStatus
+  /** The last characters of the output the model read. */
+  tail?: string
+}
+
+/** The run log: `seq` is the next id; `list` holds the newest runs, oldest first. */
+export type Runs = { seq: number; list: Run[] }
+
+/**
+ * State of the section headers, the program groups and the run tails. It is its own atom:
+ * the folder press writes the whole `View` value, so these fields cannot live there.
+ */
+export type Sections = { filesClosed?: boolean; runsOpen?: boolean; groups: string[]; ran: number[] }
+
 declare module 'claude-code' {
   interface PluginState {
-    footprint: { ledger: Shaped<Ledger>; view: Shaped<View> }
+    footprint: { ledger: Shaped<Ledger>; view: Shaped<View>; runs: Shaped<Runs>; sections: Shaped<Sections> }
   }
 }

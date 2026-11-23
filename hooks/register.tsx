@@ -1,9 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register, RenderChildren } from 'claude-code'
 
-import type { Change, Ledger, Mark, Obs, Observation, Via, View } from '../types'
+import type { Change, Ledger, Mark, Obs, Observation, Run, RunStatus, Runs, Sections, Via, View } from '../types'
 
 const PANE = 'footprint'
+const RUNS_CAP = 100
+const CMD_MAX = 2000
+const TAIL_MAX = 1000
 const CAP = 20000
 const BUDGET_MS = 5000
 const SKIP = new Set([
@@ -17,6 +20,11 @@ const ledger = atom({ plugin: 'footprint', key: 'ledger' } as const, { files: {}
   shape: 'ledger-2',
 })
 const view = atom({ plugin: 'footprint', key: 'view' } as const, { expanded: [] } as View, { shape: 'view-2' })
+const runs = atom({ plugin: 'footprint', key: 'runs' } as const, { seq: 0, list: [] } as Runs, { shape: 'runs-1' })
+// Its own atom: the folder press writes the whole `view` value, which would erase these fields.
+const sections = atom({ plugin: 'footprint', key: 'sections' } as const, { groups: [], ran: [] } as Sections, {
+  shape: 'sections-1',
+})
 
 // ---- paths -----------------------------------------------------------------
 
@@ -214,6 +222,116 @@ async function diff($: Engine, before: Snap, after: Snap, known: string[], root:
   return out.map(o => (o.via ? { ...o, seen } : o))
 }
 
+// ---- runs ------------------------------------------------------------------
+
+/** The tools whose call runs a shell command. A new command tool is one new entry here and in `commandOf`. */
+const COMMAND_TOOLS = ['Bash', 'Monitor'] as const
+
+/** The command text of a call, or undefined when it has none (a Monitor on a WebSocket). */
+function commandOf(e: { tool: string; command?: unknown }): string | undefined {
+  switch (e.tool as (typeof COMMAND_TOOLS)[number]) {
+    case 'Bash':
+    case 'Monitor':
+      return typeof e.command === 'string' && e.command !== '' ? e.command : undefined
+  }
+}
+
+const WRAPPERS = new Set(['sudo', 'env', 'time', 'nice', 'nohup', 'command', 'exec'])
+// Wrapper flags that take a value: that value is not the program.
+const VALUE_FLAGS: Record<string, string[]> = {
+  sudo: ['-u', '-g', '-C', '-h', '-p', '-U', '-D', '-R', '-T'],
+  nice: ['-n'],
+  env: ['-u', '-C', '-S'],
+  time: ['-f', '-o'],
+}
+const ASSIGN = /^[A-Za-z_]\w*=/
+// What a command may start with before its program: spaces, `(`, comment lines, `cd <path> &&`, `NAME=value`.
+const LEAD = new RegExp(
+  String.raw`^(?:\s+|\(|#[^\n]*(?:\n|$)|cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)|[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S*))+`,
+)
+
+/**
+ * The program a command runs: the first word after the lead, `cd x &&`, `NAME=value` words and wrappers.
+ * ponytail: a word scan, not a shell parser: `bash -c "git push"` is `bash`, `xargs git` is `xargs`.
+ */
+export function programOf(command: string): string {
+  const words = command.replace(LEAD, '').split(/\s+/).filter(Boolean)
+  let i = 0
+  while (words[i] !== undefined && WRAPPERS.has(words[i]!)) {
+    const wrapper = words[i++]!
+    while (words[i]?.startsWith('-')) {
+      const flag = words[i++]!
+      if (VALUE_FLAGS[wrapper]?.includes(flag)) i++
+    }
+    while (words[i] !== undefined && ASSIGN.test(words[i]!)) i++
+  }
+  return words[i]?.replace(/\)+$/, '').split(/[\\/]/).pop() || 'other'
+}
+
+const WORST = ['failed', 'interrupted', 'background'] as const
+export type Group = { name: string; runs: Run[]; worst?: (typeof WORST)[number] }
+
+/** The runs by program: runs and groups newest first (by start time, then id); `worst` is unset when all are ok. */
+export function groupRuns(list: Run[]): Group[] {
+  const by = new Map<string, Run[]>()
+  for (const r of list) {
+    const k = programOf(r.command)
+    by.set(k, [...(by.get(k) ?? []), r])
+  }
+  const newer = (a: Run, b: Run) => b.at - a.at || b.id - a.id
+  return [...by.entries()]
+    .map(([name, rs]) => ({
+      name,
+      runs: [...rs].sort(newer),
+      worst: WORST.find(s => rs.some(r => r.status === s)),
+    }))
+    .sort((a, b) => newer(a.runs[0]!, b.runs[0]!))
+}
+
+/** The status of a finished call. The typed result fields exist only when the call did not error. */
+export function statusOf(
+  tool: string,
+  ran: { isError?: boolean; result?: unknown },
+  aborted: boolean,
+): RunStatus {
+  if (aborted) return 'interrupted'
+  if (ran.isError) return 'failed'
+  const r = (typeof ran.result === 'object' && ran.result) || {}
+  if (tool === 'Monitor' || (r as { backgroundTaskId?: string }).backgroundTaskId) return 'background'
+  return (r as { interrupted?: boolean }).interrupted ? 'interrupted' : 'ok'
+}
+
+const OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g // hyperlinks and titles: the escape and its payload
+const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
+const CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g // every control character except newline and tab (CR included)
+
+/** Text for the pane: no escape sequences, no control characters; a CRLF becomes a newline. */
+export const clean = (s: string) => s.replace(/\r\n/g, '\n').replace(OSC, '').replace(ANSI, '').replace(CONTROL, '')
+
+/** The last TAIL_MAX characters of what the model read: `text` holds it on every call, errors included. */
+export function tailOf(ran: { text?: string; result?: unknown }): string | undefined {
+  const t = clean(ran.text ?? (typeof ran.result === 'string' ? ran.result : '')).trimEnd()
+  return t ? t.slice(-TAIL_MAX) : undefined
+}
+
+const clip = (c: string) => (c.length > CMD_MAX ? c.slice(0, CMD_MAX - 1) + '…' : c)
+
+export const fmtMs = (ms: number) => {
+  const tenths = Math.floor(Math.max(0, ms) / 100)
+  if (tenths < 600) return `${(tenths / 10).toFixed(1)}s`
+  const s = Math.floor(tenths / 10)
+  return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
+}
+
+// The run log's whole write API: recordRun. The change function is pure: update may run it more than once,
+// so the id comes from the `seq` it receives, never from outside.
+function recordRun($: Engine, run: Omit<Run, 'id'>) {
+  return update($, runs, l => ({ seq: l.seq + 1, list: [...l.list, { ...run, id: l.seq }].slice(-RUNS_CAP) }))
+}
+
+// The section state's whole write API: patchSections. Only section, group and run presses call it.
+const patchSections = ($: Engine, fn: (s: Sections) => Sections) => update($, sections, fn)
+
 // ---- hooks -----------------------------------------------------------------
 
 export const register: Register = on => {
@@ -278,6 +396,34 @@ export const register: Register = on => {
     }
   }).catch(($, e, next) => next(e))
 
+  // Runs source: one record per shell command, timed around the call. It registers after the two hooks
+  // above, so it is the innermost: `ms` leaves out their snapshot walks but holds a permission prompt.
+  on('tool.call', { tool: [...COMMAND_TOOLS] }, async ($, e, next) => {
+    const command = commandOf(e)
+    if (command === undefined) return next(e)
+    const at = await $.clock.now()
+    const log = async (status: RunStatus, tail?: string) =>
+      recordRun($, {
+        tool: e.tool as Run['tool'],
+        command: clip(clean(command)),
+        at,
+        ms: (await $.clock.now()) - at,
+        status,
+        tail,
+      })
+    // A call that throws still ran: it is `interrupted` after an abort, else `failed`, and the error goes on.
+    const ran = await next(e).catch(async (err: unknown) => {
+      await log(next.signal.aborted ? 'interrupted' : 'failed')
+      throw err
+    })
+    if (ran.deny !== undefined) return ran
+    // Read the signal before any await: an interrupt that lands after the call ended must not mark it.
+    const status = statusOf(e.tool, ran, next.signal.aborted)
+    // A background run, and a Monitor, has no output yet: `text` only says it started.
+    await log(status, status === 'background' ? undefined : tailOf(ran))
+    return ran
+  }).catch(($, e, next) => next(e))
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
@@ -290,6 +436,8 @@ export const register: Register = on => {
     const sep = sepOf(cwd0)
     const cwd = canon(cwd0, sep)
     const now = await $.clock.now()
+    const sec = await read($, sections)
+    const log = (await read($, runs)).list
 
     type File = { name: string; path: string; mark: Mark; st: Change }
     type Node = { dirs: Map<string, Node>; files: File[]; path: string; last?: Mark['last']; count: number }
@@ -387,7 +535,12 @@ export const register: Register = on => {
     // The desktop paints an Svg only with an explicit width: without one its slot in a row Box is zero.
     // An Svg takes no press, so a folder's drawn box gets an invisible plain Button laid over it:
     // an absolute Box anchored to the Svg's right edge (where the box is), holding one em space.
-    const lead = (more: boolean[], isLast: boolean, dir?: { open: boolean; path: string }) => {
+    // A folder's press toggles it in `view`; a section or group header brings its own `press`.
+    const lead = (
+      more: boolean[],
+      isLast: boolean,
+      dir?: { open: boolean; path: string; press?: () => void; alt?: string },
+    ) => {
       if (!Svg) {
         // The terminal drops a Text of spaces alone, so indent is fixed-width Boxes holding the same
         // guide lines as the Svg: column j carries `│` when more[j + 1], the last column the branch.
@@ -403,20 +556,20 @@ export const register: Register = on => {
             {d > 0 && cell('b', isLast ? '└─' : '├─')}
             {/* A file's branch runs on where a folder's +/- sits, so file and folder names line up. */}
             {!dir && cell('f', d > 0 ? '──' : undefined)}
-            {dir && <Button plain key={'d:' + dir.path} onPress={() => toggle(dir.path)}>{dir.open ? '-' : '+'}</Button>}
+            {dir && <Button plain key={'d:' + dir.path} onPress={dir.press ?? (() => toggle(dir.path))}>{dir.open ? '-' : '+'}</Button>}
           </Box>
         )
       }
       const g = guides(more, isLast, dir)
       // alt must be non-empty: the desktop drops an Svg whose alt is blank.
-      const alt = dir ? (dir.open ? 'collapse folder' : 'expand folder') : 'tree branch'
+      const alt = dir ? (dir.alt ?? (dir.open ? 'collapse folder' : 'expand folder')) : 'tree branch'
       const svg = <Svg source={g.svg} alt={alt} width={g.w} height={H} />
       if (!dir) return svg
       return (
         <Box position="relative">
           {svg}
           <Box position="absolute" top={0} right={0}>
-            <Button plain key={'d:' + dir.path} onPress={() => toggle(dir.path)}>{'\u2003'}</Button>
+            <Button plain key={'d:' + dir.path} onPress={dir.press ?? (() => toggle(dir.path))}>{'\u2003'}</Button>
           </Box>
         </Box>
       )
@@ -504,20 +657,142 @@ export const register: Register = on => {
       return out
     }
 
-    const body = tree.count === 0 ? <Text dimColor>No files touched yet.</Text> : rows(tree, [])
+    // ---- sections: Files and Runs, each under a header row drawn like a top-level folder row ----
+    const flip = (id: 'files' | 'runs') =>
+      void patchSections($, s => (id === 'files' ? { ...s, filesClosed: !s.filesClosed } : { ...s, runsOpen: !s.runsOpen }))
+    const header = (id: 'files' | 'runs', isOpen: boolean, label: string, count: number, failed = 0, bg?: string) => (
+      <Box key={'sh:' + id} flexDirection="row" overflow="hidden" backgroundColor={bg}>
+        {fixed(
+          lead([], true, {
+            open: isOpen,
+            path: 'sec:' + id,
+            press: () => flip(id),
+            alt: isOpen ? 'collapse section' : 'expand section',
+          }),
+        )}
+        <Box flexShrink={1} minWidth={0}>
+          <Button plain key={'sec:' + id} onPress={() => flip(id)}>
+            <Text weight="medium"> {label}</Text>
+            <Text dimColor> {count}</Text>
+            {failed > 0 && <Text color={COLOR.deleted}> · {failed} failed</Text>}
+          </Button>
+        </Box>
+      </Box>
+    )
+
+    const MARK: Record<RunStatus, { glyph: string; color?: string }> = {
+      ok: { glyph: '●' },
+      failed: { glyph: '✕', color: COLOR.deleted },
+      background: { glyph: '◌', color: 'warning' },
+      interrupted: { glyph: '■', color: 'warning' },
+    }
+    const toggleGroup = (name: string) =>
+      void patchSections($, s => ({
+        ...s,
+        groups: s.groups.includes(name) ? s.groups.filter(n => n !== name) : [...s.groups, name],
+      }))
+    // A run press also drops the ids of runs the log has cut: `ran` never outgrows the log.
+    const toggleRun = (id: number) =>
+      void (async () => {
+        const live = new Set((await read($, runs)).list.map(r => r.id))
+        await patchSections($, s => ({
+          ...s,
+          ran: (s.ran.includes(id) ? s.ran.filter(x => x !== id) : [...s.ran, id]).filter(x => live.has(x)),
+        }))
+      })().catch(() => undefined)
+
+    // One run: its mark, the whole command (wrapped, never cut) and the time. Only a run with output takes a press.
+    // The command is always plain Text: a Button would flatten it on the desktop and lose the monospace face and the
+    // wrapping. The press sits on the mark instead, as on a file row: an invisible Button over the mark where Svg
+    // draws, the mark itself as the Button elsewhere.
+    const entry = (r: Run, isOpen: boolean) => {
+      const m = MARK[r.status]
+      const press = r.tail ? () => toggleRun(r.id) : undefined
+      const mark = <Text color={m.color} dimColor={r.status === 'ok'}>{m.glyph}</Text>
+      return (
+        <Box key={'rre:' + r.id} flexDirection="column" paddingLeft={5}>
+          <Box flexDirection="row" gap={1}>
+            <Box flexShrink={0} width={1} position={Svg && press ? 'relative' : undefined}>
+              {press && !Svg ? <Button plain key={'rr:' + r.id} onPress={press}>{m.glyph}</Button> : mark}
+              {press && Svg && (
+                <Box position="absolute" top={0} left={0}>
+                  <Button plain key={'rr:' + r.id} onPress={press}>{' '}</Button>
+                </Box>
+              )}
+            </Box>
+            <Box flexShrink={1} flexGrow={1} minWidth={0}>
+              <Text mono>{r.command}</Text>
+            </Box>
+            <Box flexShrink={0}>
+              <Text dimColor>{r.status === 'background' ? 'background' : fmtMs(r.ms)}</Text>
+            </Box>
+          </Box>
+          {isOpen && r.tail && (
+            <Box key={'rt:' + r.id} paddingLeft={2}>
+              <Text mono dimColor>{r.tail}</Text>
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    const runsSection = (): RenderChildren[] => {
+      const failed = log.filter(r => r.status === 'failed').length
+      const isOpen = !!sec.runsOpen
+      const out: RenderChildren[] = [header('runs', isOpen, 'Runs', log.length, failed)]
+      if (!isOpen) return out
+      const openGroups = new Set(sec.groups)
+      const openTails = new Set(sec.ran)
+      for (const g of groupRuns(log)) {
+        const gOpen = openGroups.has(g.name)
+        out.push(
+          <Box key={'rgr:' + g.name} flexDirection="row" overflow="hidden" paddingLeft={2}>
+            {fixed(
+              lead([], true, {
+                open: gOpen,
+                path: 'rg:' + g.name,
+                press: () => toggleGroup(g.name),
+                alt: gOpen ? 'collapse group' : 'expand group',
+              }),
+            )}
+            <Box flexShrink={1} minWidth={0}>
+              <Button plain key={'rg:' + g.name} onPress={() => toggleGroup(g.name)}>
+                <Text wrap="truncate-middle"> {g.name}</Text>
+                <Text dimColor> {g.runs.length}</Text>
+                {g.worst && <Text color={MARK[g.worst].color}> {MARK[g.worst].glyph}</Text>}
+              </Button>
+            </Box>
+          </Box>,
+        )
+        if (gOpen) for (const r of g.runs) out.push(entry(r, openTails.has(r.id)))
+      }
+      return out
+    }
+
+    // A change in a closed Files section flashes its header: the one row that still shows it.
+    const filesOpen = !sec.filesClosed
+    const filesHeader = header('files', filesOpen, 'Files', tree.count, 0, filesOpen ? undefined : flash(tree.last))
+    // The tree hangs one level under its header: `more` starts with one entry, so each top row draws a branch.
+    const filesBody: RenderChildren[] = !filesOpen
+      ? []
+      : tree.count === 0
+        ? [<Box key="empty" paddingLeft={2}><Text dimColor>No files touched yet.</Text></Box>]
+        : rows(tree, [false])
     // ponytail: the fade is redraws on a timer (ten a second at most); a Client module if it ever looks choppy.
     if (flashing) $.clock.after(100, () => $.ui.invalidate('ui.render'))
 
     return (
       <Box flexDirection="column">
-        {/* The pane's own title already says Footprint; the row keeps only the count. */}
-        <Text dimColor>{tree.count} file{tree.count === 1 ? '' : 's'}</Text>
+        {filesHeader}
         {l.bashUntracked && (
-          <Text color="warning">
-            Bash changes not tracked: {l.bashUntracked.reason === 'cap' ? `tree over ${CAP} files` : 'walk over time budget'}
-          </Text>
+          <Box paddingLeft={2}>
+            <Text color="warning">
+              Bash changes not tracked: {l.bashUntracked.reason === 'cap' ? `tree over ${CAP} files` : 'walk over time budget'}
+            </Text>
+          </Box>
         )}
-        {body}
+        {filesBody}
+        {log.length > 0 && <Box flexDirection="column" marginTop={1}>{runsSection()}</Box>}
       </Box>
     )
   })
