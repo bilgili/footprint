@@ -1,6 +1,6 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { FsEntry, On } from 'claude-code'
-import { clean, fmtMs, groupRuns, programOf, statusOf, tailOf } from './register'
+import { clean, endOf, FADE, fmtMs, groupRuns, HOLD, isHot, lastEnded, programOf, pulse, RUN_COLOR, statusOf, tailOf } from './register'
 import type { Run } from '../types'
 
 const PANE = {
@@ -721,4 +721,269 @@ test('tailOf takes the model-read text, strips escapes and control characters, k
   expect(tailOf({ result: 'Exit code 2' })).toBe('Exit code 2')
   expect(tailOf({ text: '' })).toBe(undefined)
   expect(tailOf({ text: 'a'.repeat(1500) + 'END' })).toHaveLength(1000)
+})
+
+// ---- Run flash ---------------------------------------------------------------
+
+// The flash tests run on a mock clock: it stands still until the test moves it, and `advance` fires the pane's
+// redraw timer. Nothing else draws the pane, so a missing timer shows as a flash that never fades.
+// `hold` makes a command wait until the test releases it: the mock clock moves only when the test advances it.
+function clockWorld(on: On, call: (e: any) => object = () => OK(), hold: (e: any) => Promise<void> | undefined = () => undefined) {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('command.register', () => ({ value: { command: 'footprint' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.cwd', () => ({ value: '/r' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [] }))
+  on('tool.call', async (_, e) => {
+    await hold(e)
+    return call(e) as any
+  })
+  return clock
+}
+const bgOf = (ui: { find: (q: any) => Promise<any> }, key: string) => async () =>
+  (await ui.find({ type: 'Box', key }))?.props.backgroundColor as string | undefined
+
+test('a run flashes the closed Runs header, then fades with no other event to draw it', async ($, on) => {
+  const clock = clockWorld(on)
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const header = bgOf(ui, 'sh:runs')
+  expect(await header()).toMatch(/^#3FB950/)
+  // Past the hold the flash is still on, and fainter.
+  await clock.advance(HOLD + 50)
+  const fading = await header()
+  expect(fading).toMatch(/^#3FB950/)
+  expect(fading).not.toBe('#3FB95099')
+  // No press, no new event: the timer alone ends it.
+  await clock.advance(FADE)
+  expect(await header()).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a run flashes only the row that shows it: header, closed group, or entry', async ($, on) => {
+  clockWorld(on)
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // Section closed: the header.
+  expect(await bgOf(ui, 'sh:runs')()).toMatch(/^#3FB950/)
+  // Section open, group closed: the group row, not the header.
+  await ui.press({ key: 'sec:runs' })
+  expect(await bgOf(ui, 'sh:runs')()).toBe(undefined)
+  expect(await bgOf(ui, 'rgr:git')()).toMatch(/^#3FB950/)
+  // Group open: the entry row, not the group row and not the header.
+  await ui.press({ key: 'rg:git' })
+  expect(await bgOf(ui, 'rgr:git')()).toBe(undefined)
+  expect(await bgOf(ui, 'sh:runs')()).toBe(undefined)
+  expect(await bgOf(ui, 'rrow:0')()).toMatch(/^#3FB950/)
+  await ui.unmount()
+})
+
+test('the flash takes the color of the status: ok green, failed red, background and interrupted amber', async ($, on) => {
+  clockWorld(on, e => {
+    if (e.command === 'failc') return FAIL('boom')
+    if (e.command === 'bgc') return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b' }, text: '' }
+    if (e.command === 'intc') return { result: { stdout: '', stderr: '', interrupted: true }, text: '' }
+    return OK()
+  })
+  for (const command of ['okc', 'failc', 'bgc', 'intc'])
+    await $.tool.call({ tool: 'Bash', command, ...(command === 'bgc' ? { run_in_background: true } : {}) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  for (const g of ['okc', 'failc', 'bgc', 'intc']) await ui.press({ key: 'rg:' + g })
+  expect(await bgOf(ui, 'rrow:0')()).toMatch(/^#3FB950/)
+  expect(await bgOf(ui, 'rrow:1')()).toMatch(/^#E24B4A/)
+  expect(await bgOf(ui, 'rrow:2')()).toMatch(/^#D29922/)
+  expect(await bgOf(ui, 'rrow:3')()).toMatch(/^#D29922/)
+  await ui.unmount()
+})
+
+test('an older run does not flash, and a flash is over after 3 seconds', async ($, on) => {
+  const clock = clockWorld(on)
+  await $.tool.call({ tool: 'Bash', command: 'git a' })
+  await clock.advance(10_000)
+  await $.tool.call({ tool: 'Bash', command: 'git b' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:git' })
+  expect(await bgOf(ui, 'rrow:0')()).toBe(undefined)
+  expect(await bgOf(ui, 'rrow:1')()).toMatch(/^#3FB950/)
+  await clock.advance(FADE)
+  expect(await bgOf(ui, 'rrow:1')()).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a closed row flashes for the run that ended last', async ($, on) => {
+  const clock = clockWorld(on, e => (e.command === 'badc' ? FAIL('boom') : OK()))
+  await $.tool.call({ tool: 'Bash', command: 'goodc' })
+  await clock.advance(1)
+  await $.tool.call({ tool: 'Bash', command: 'badc' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await bgOf(ui, 'sh:runs')()).toMatch(/^#E24B4A/)
+  await ui.unmount()
+})
+
+test('status-colored text is white and not dim while a row flashes at full strength', async ($, on) => {
+  const clock = clockWorld(on, e => (e.command === 'badc' ? FAIL('boom') : OK()))
+  await $.tool.call({ tool: 'Bash', command: 'goodc' })
+  await $.tool.call({ tool: 'Bash', command: 'badc' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // Closed header: its `1 failed` text.
+  expect((await ui.find({ type: 'Text', text: /1 failed/ }))?.props.color).toBe('#FFFFFF')
+  await ui.press({ key: 'sec:runs' })
+  // Closed group `badc`: its worst-status mark.
+  expect((await ui.find({ type: 'Text', text: /✕/ }))?.props.color).toBe('#FFFFFF')
+  await ui.press({ key: 'rg:goodc' })
+  // Open group `goodc`: the entry mark is white and not dim.
+  const mark = await ui.find({ type: 'Text', text: /^●$/ })
+  expect(mark?.props.color).toBe('#FFFFFF')
+  expect(mark?.props.dimColor).toBeFalsy()
+  // The command text keeps its own color.
+  expect((await ui.find({ type: 'Text', text: /^goodc$/ }))?.props.color).toBeUndefined()
+  // After the hold the text takes its own color again, and the ok mark is dim.
+  await clock.advance(HOLD + 50)
+  const later = await ui.find({ type: 'Text', text: /^●$/ })
+  expect(later?.props.color).not.toBe('#FFFFFF')
+  expect(later?.props.dimColor).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /✕/ }))?.props.color).toBe('#E24B4A')
+  await ui.unmount()
+})
+
+test('the flash covers the row of an entry and not its box or its output', async ($, on) => {
+  clockWorld(on, () => OK('some output'))
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:git' })
+  await ui.press({ key: 'rr:0' })
+  expect(await ui.find({ type: 'Box', key: 'rt:0' })).toBeDefined()
+  expect(await bgOf(ui, 'rrow:0')()).toMatch(/^#3FB950/)
+  expect(await bgOf(ui, 'rre:0')()).toBe(undefined)
+  expect(await bgOf(ui, 'rt:0')()).toBe(undefined)
+  await ui.unmount()
+})
+
+test('on the terminal the same row flashes in the same color', async ($, on) => {
+  clockWorld(on, e => (e.command === 'badc' ? FAIL('boom') : OK()))
+  await $.tool.call({ tool: 'Bash', command: 'badc' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await bgOf(ui, 'sh:runs')()).toMatch(/^#E24B4A/)
+  await ui.press({ key: 'sec:runs' })
+  expect(await bgOf(ui, 'rgr:badc')()).toMatch(/^#E24B4A/)
+  await ui.press({ key: 'rg:badc' })
+  expect(await bgOf(ui, 'rrow:0')()).toMatch(/^#E24B4A/)
+  await ui.unmount()
+})
+
+test('the row of an entry aligns its children to the start, so the mark sits on the first line', async ($, on) => {
+  clockWorld(on)
+  await $.tool.call({ tool: 'Bash', command: 'git log --oneline --decorate --graph --max-count=5 --format="%h %an %ad %s"' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  await ui.press({ key: 'rg:git' })
+  expect((await ui.find({ type: 'Box', key: 'rrow:0' }))?.props.alignItems).toBe('flex-start')
+  await ui.unmount()
+})
+
+test('a closed group flashes for the run that ended last, not the one that started last', async ($, on) => {
+  let release = () => {}
+  const gate = new Promise<void>(res => (release = res))
+  const clock = clockWorld(on, e => (e.command === 'git slow' ? FAIL('boom') : OK()), e => (e.command === 'git slow' ? gate : undefined))
+  // The slow run starts first and ends last; the quick one starts later and ends in between.
+  const slow = $.tool.call({ tool: 'Bash', command: 'git slow' })
+  await clock.advance(100)
+  await $.tool.call({ tool: 'Bash', command: 'git quick' })
+  await clock.advance(400)
+  release()
+  await slow
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'sec:runs' })
+  expect(await bgOf(ui, 'rgr:git')()).toMatch(/^#E24B4A/)
+  await ui.unmount()
+})
+
+test('one timer at a time: a flash draws a bounded number of times, and none once it is over', async ($, on) => {
+  const clock = clockWorld(on)
+  let draws = 0
+  on('ui.invalidate', (_, e, next) => {
+    draws++
+    return next(e)
+  })
+  // The pane is open while the commands run: each state write draws it again, and each draw could arm a timer.
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // The commands end at different times, so a timer armed for each would fall due at different times too.
+  for (let i = 0; i < 5; i++) {
+    await $.tool.call({ tool: 'Bash', command: `echo ${i}` })
+    await clock.advance(30)
+  }
+  await clock.advance(FADE + 300)
+  const during = draws
+  // Ten a second for three seconds is about thirty; a timer chain for each run would be five times that.
+  expect(during).toBeLessThan(80)
+  await clock.advance(5000)
+  expect(draws).toBe(during)
+  await ui.unmount()
+})
+
+test('a timer that never fires is replaced by the next draw, so a later flash still fades', async ($, on) => {
+  let t = 1_000_000
+  let afters = 0
+  let pending: { due: number; fire: () => void }[] = []
+  on('clock.now', () => ({ value: t }))
+  // The first timer is lost: a hook that refuses it, or a host that drops it, never runs its callback.
+  on('clock.after', (_, e) => new Promise<any>(res => {
+    afters++
+    if (afters > 1) pending.push({ due: t + e.ms, fire: () => res({ value: undefined }) })
+  }))
+  on('command.register', () => ({ value: { command: 'footprint' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.cwd', () => ({ value: '/r' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [] }))
+  on('tool.call', () => ({ result: {} }) as any)
+  await $.tool.call({ tool: 'Write', file_path: '/r/a.ts', content: 'x' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const folder = bgOf(ui, 'rd:/r')
+  expect(await folder()).toBeDefined()
+  const step = async (ms: number) => {
+    t += ms
+    const due = pending.filter(p => p.due <= t)
+    pending = pending.filter(p => p.due > t)
+    due.forEach(p => p.fire())
+    for (let i = 0; i < 200; i++) await Promise.resolve()
+    await ui.find({ type: 'Box' })
+  }
+  // Ten seconds on, a second file changes: that draw must arm a new timer, though the first one never fired.
+  t += 10_000
+  await $.tool.call({ tool: 'Write', file_path: '/r/b.ts', content: 'x' })
+  expect(await folder()).toBeDefined()
+  for (let i = 0; i < 34; i++) await step(100)
+  expect(await folder()).toBe(undefined)
+  await ui.unmount()
+})
+
+test('pulse and isHot: the hold, the fade and the edges', () => {
+  const at = 5000
+  expect(pulse(at - 1, at, '#3FB950')).toBe(undefined)
+  expect(pulse(at, at, '#3FB950')).toBe('#3FB95099')
+  expect(pulse(at + HOLD - 1, at, '#3FB950')).toBe('#3FB95099')
+  expect(pulse(at + HOLD, at, '#3FB950')).toBe('#3FB95099')
+  expect(pulse(at + FADE - 1, at, '#3FB950')).toBe('#3FB95000')
+  expect(pulse(at + FADE, at, '#3FB950')).toBe(undefined)
+  expect(isHot(at - 1, at)).toBe(false)
+  expect(isHot(at, at)).toBe(true)
+  expect(isHot(at + HOLD - 1, at)).toBe(true)
+  expect(isHot(at + HOLD, at)).toBe(false)
+  expect(Object.values(RUN_COLOR).every(c => /^#[0-9A-F]{6}$/.test(c))).toBe(true)
+})
+
+test('lastEnded picks the run with the latest end, and the higher id on a tie', () => {
+  const run = (id: number, at: number, ms: number): Run => ({ id, tool: 'Bash', command: 'x', at, ms, status: 'ok' })
+  expect(lastEnded([])).toBe(undefined)
+  expect(lastEnded([run(0, 10, 2), run(1, 4, 3)])?.id).toBe(0)
+  // A run that started earlier but ended later is the last one.
+  expect(lastEnded([run(0, 10, 2), run(1, 4, 20)])?.id).toBe(1)
+  // Equal ends: the higher id.
+  expect(lastEnded([run(0, 10, 5), run(1, 12, 3), run(2, 5, 10)])?.id).toBe(2)
+  expect(endOf(run(0, 10, 5))).toBe(15)
 })

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface as Engine, Register, RenderChildren } from 'claude-code'
+import type { EngineInterface as Engine, Register, RenderChildren, Timer } from 'claude-code'
 
 import type { Change, Ledger, Mark, Obs, Observation, Run, RunStatus, Runs, Sections, Via, View } from '../types'
 
@@ -323,6 +323,50 @@ export const fmtMs = (ms: number) => {
   return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
 }
 
+// ---- flash -----------------------------------------------------------------
+
+/** A flash holds full strength for HOLD ms, then fades to nothing by FADE ms. */
+export const HOLD = 750
+export const FADE = 3000
+
+/** The background of a flash that began at `at`: `color` (`#RRGGBB`) plus an alpha, or nothing once it is over. */
+export function pulse(now: number, at: number, color: string): string | undefined {
+  const age = now - at
+  if (age >= FADE || age < 0) return undefined
+  const a = age < HOLD ? 0.6 : 0.6 * (1 - (age - HOLD) / (FADE - HOLD))
+  return color + Math.round(a * 255).toString(16).padStart(2, '0')
+}
+
+/** True while a flash is at full strength: the status-colored text of its row turns white. */
+export const isHot = (now: number, at: number) => now - at >= 0 && now - at < HOLD
+
+/** The status is the file name's colour (no glyphs): green added, blue modified, red struck-through deleted. */
+const COLOR: Record<Change, string> = { added: '#3FB950', modified: '#1E90FF', deleted: '#E24B4A' }
+/** Status-colored text turns white while its row flashes at full strength. */
+const WHITE = '#FFFFFF'
+
+/** The flash color of a run, by status: the file colors, and amber. Each is `#RRGGBB`: `pulse` adds the alpha. */
+export const RUN_COLOR: Record<RunStatus, string> = {
+  ok: COLOR.added,
+  failed: COLOR.deleted,
+  background: '#D29922',
+  interrupted: '#D29922',
+}
+
+/** One flash of a row: its background (nothing once it is over) and whether it is at full strength. */
+const flashOf = (now: number, at: number, color: string) => ({ bg: pulse(now, at, color), hot: isHot(now, at) })
+
+/** When a run ended: the hook reads `at` before the call and `ms` after it. */
+export const endOf = (r: Run) => r.at + r.ms
+
+/** The run that ended last; on a tie, the one with the higher id. */
+export function lastEnded(list: Run[]): Run | undefined {
+  return list.reduce<Run | undefined>(
+    (best, r) => (!best || endOf(r) > endOf(best) || (endOf(r) === endOf(best) && r.id > best.id) ? r : best),
+    undefined,
+  )
+}
+
 // The run log's whole write API: recordRun. The change function is pure: update may run it more than once,
 // so the id comes from the `seq` it receives, never from outside.
 function recordRun($: Engine, run: Omit<Run, 'id'>) {
@@ -339,6 +383,8 @@ export const register: Register = on => {
   const granted = new Set<string>()
   /** Grant requests the user has not answered yet, by folder. */
   const asking = new Map<string, Promise<boolean>>()
+  /** The timer that draws the pane again while a flash lasts: one at a time. */
+  let redraw: Timer | undefined
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'footprint', description: 'Show the files this session touched' })
     // The terminal opens a pane inline on its main screen; there /footprint opens it on demand.
@@ -466,19 +512,7 @@ export const register: Register = on => {
       n.files.push({ name, path, mark, st })
     }
 
-    // Flash: full color for HOLD ms, then fade to nothing by FADE ms.
-    const HOLD = 750
-    const FADE = 3000
-    // The status is the name's colour (no glyphs): green added, blue modified, red struck-through deleted.
-    const COLOR: Record<Change, string> = { added: '#3FB950', modified: '#1E90FF', deleted: '#E24B4A' }
-    let flashing = false
-    const flash = (last: Mark['last']) => {
-      const age = last ? now - last.at : FADE
-      if (age >= FADE || age < 0) return undefined
-      flashing = true
-      const a = age < HOLD ? 0.6 : 0.6 * (1 - (age - HOLD) / (FADE - HOLD))
-      return COLOR[last!.change] + Math.round(a * 255).toString(16).padStart(2, '0')
-    }
+    const flash = (last: Mark['last']) => last && pulse(now, last.at, COLOR[last.change])
 
     const toggle = (dir: string) =>
       void update($, view, v => ({
@@ -613,9 +647,9 @@ export const register: Register = on => {
         // White only while the flash is at full strength (a same-hue name is unreadable on it); once the
         // fade starts the status colour returns, so a light theme never shows white on a near-white row.
         const bg = flash(f.mark.last && { at: f.mark.last.at, change: f.st })
-        const hot = !!f.mark.last && now - f.mark.last.at >= 0 && now - f.mark.last.at < HOLD
+        const hot = !!f.mark.last && isHot(now, f.mark.last.at)
         const label = (
-          <Text wrap="truncate-middle" color={hot ? '#FFFFFF' : COLOR[f.st]} strikethrough={f.st === 'deleted'}>
+          <Text wrap="truncate-middle" color={hot ? WHITE : COLOR[f.st]} strikethrough={f.st === 'deleted'}>
             {f.name}
           </Text>
         )
@@ -660,8 +694,16 @@ export const register: Register = on => {
     // ---- sections: Files and Runs, each under a header row drawn like a top-level folder row ----
     const flip = (id: 'files' | 'runs') =>
       void patchSections($, s => (id === 'files' ? { ...s, filesClosed: !s.filesClosed } : { ...s, runsOpen: !s.runsOpen }))
-    const header = (id: 'files' | 'runs', isOpen: boolean, label: string, count: number, failed = 0, bg?: string) => (
-      <Box key={'sh:' + id} flexDirection="row" overflow="hidden" backgroundColor={bg}>
+    // `fl.hot`: the header flashes at full strength, so its status-colored text turns white (red on red cannot be read).
+    const header = (
+      id: 'files' | 'runs',
+      isOpen: boolean,
+      label: string,
+      count: number,
+      failed = 0,
+      fl?: { bg?: string; hot: boolean },
+    ) => (
+      <Box key={'sh:' + id} flexDirection="row" overflow="hidden" backgroundColor={fl?.bg}>
         {fixed(
           lead([], true, {
             open: isOpen,
@@ -674,7 +716,7 @@ export const register: Register = on => {
           <Button plain key={'sec:' + id} onPress={() => flip(id)}>
             <Text weight="medium"> {label}</Text>
             <Text dimColor> {count}</Text>
-            {failed > 0 && <Text color={COLOR.deleted}> · {failed} failed</Text>}
+            {failed > 0 && <Text color={fl?.hot ? WHITE : COLOR.deleted}> · {failed} failed</Text>}
           </Button>
         </Box>
       </Box>
@@ -705,15 +747,25 @@ export const register: Register = on => {
     // The command is always plain Text: a Button would flatten it on the desktop and lose the monospace face and the
     // wrapping. The press sits on the mark instead, as on a file row: an invisible Button over the mark where Svg
     // draws, the mark itself as the Button elsewhere.
+    // A new run flashes on its entry while its group is open. The row has its own Box (`rrow:`) so the flash covers
+    // the row and not the output. The indent is a spacer Box, not padding: the flash paints content.
     const entry = (r: Run, isOpen: boolean) => {
       const m = MARK[r.status]
       const press = r.tail ? () => toggleRun(r.id) : undefined
-      const mark = <Text color={m.color} dimColor={r.status === 'ok'}>{m.glyph}</Text>
+      const { bg, hot } = flashOf(now, endOf(r), RUN_COLOR[r.status])
+      const mark = <Text color={hot ? WHITE : m.color} dimColor={!hot && r.status === 'ok'}>{m.glyph}</Text>
       return (
-        <Box key={'rre:' + r.id} flexDirection="column" paddingLeft={5}>
-          <Box flexDirection="row" gap={1}>
+        <Box key={'rre:' + r.id} flexDirection="column">
+          <Box
+            key={'rrow:' + r.id}
+            flexDirection="row"
+            gap={1}
+            alignItems="flex-start"
+            backgroundColor={bg}
+          >
+            <Box width={4} flexShrink={0} />
             <Box flexShrink={0} width={1} position={Svg && press ? 'relative' : undefined}>
-              {press && !Svg ? <Button plain key={'rr:' + r.id} onPress={press}>{m.glyph}</Button> : mark}
+              {press && !Svg ? <Button plain key={'rr:' + r.id} onPress={press}>{mark}</Button> : mark}
               {press && Svg && (
                 <Box position="absolute" top={0} left={0}>
                   <Button plain key={'rr:' + r.id} onPress={press}>{' '}</Button>
@@ -728,7 +780,7 @@ export const register: Register = on => {
             </Box>
           </Box>
           {isOpen && r.tail && (
-            <Box key={'rt:' + r.id} paddingLeft={2}>
+            <Box key={'rt:' + r.id} paddingLeft={7}>
               <Text mono dimColor>{r.tail}</Text>
             </Box>
           )}
@@ -739,14 +791,21 @@ export const register: Register = on => {
     const runsSection = (): RenderChildren[] => {
       const failed = log.filter(r => r.status === 'failed').length
       const isOpen = !!sec.runsOpen
-      const out: RenderChildren[] = [header('runs', isOpen, 'Runs', log.length, failed)]
+      // A closed row flashes for the run that ended last among the runs it hides: the header here, a group row below.
+      const hid = isOpen ? undefined : lastEnded(log)
+      const out: RenderChildren[] = [
+        header('runs', isOpen, 'Runs', log.length, failed, hid && flashOf(now, endOf(hid), RUN_COLOR[hid.status])),
+      ]
       if (!isOpen) return out
       const openGroups = new Set(sec.groups)
       const openTails = new Set(sec.ran)
       for (const g of groupRuns(log)) {
         const gOpen = openGroups.has(g.name)
+        const gHid = gOpen ? undefined : lastEnded(g.runs)
+        const gf = gHid && flashOf(now, endOf(gHid), RUN_COLOR[gHid.status])
         out.push(
-          <Box key={'rgr:' + g.name} flexDirection="row" overflow="hidden" paddingLeft={2}>
+          <Box key={'rgr:' + g.name} flexDirection="row" overflow="hidden" backgroundColor={gf?.bg}>
+            <Box width={2} flexShrink={0} />
             {fixed(
               lead([], true, {
                 open: gOpen,
@@ -759,7 +818,7 @@ export const register: Register = on => {
               <Button plain key={'rg:' + g.name} onPress={() => toggleGroup(g.name)}>
                 <Text wrap="truncate-middle"> {g.name}</Text>
                 <Text dimColor> {g.runs.length}</Text>
-                {g.worst && <Text color={MARK[g.worst].color}> {MARK[g.worst].glyph}</Text>}
+                {g.worst && <Text color={gf?.hot ? WHITE : MARK[g.worst].color}> {MARK[g.worst].glyph}</Text>}
               </Button>
             </Box>
           </Box>,
@@ -771,7 +830,14 @@ export const register: Register = on => {
 
     // A change in a closed Files section flashes its header: the one row that still shows it.
     const filesOpen = !sec.filesClosed
-    const filesHeader = header('files', filesOpen, 'Files', tree.count, 0, filesOpen ? undefined : flash(tree.last))
+    const filesHeader = header(
+      'files',
+      filesOpen,
+      'Files',
+      tree.count,
+      0,
+      filesOpen ? undefined : { bg: flash(tree.last), hot: false },
+    )
     // The tree hangs one level under its header: `more` starts with one entry, so each top row draws a branch.
     const filesBody: RenderChildren[] = !filesOpen
       ? []
@@ -779,7 +845,16 @@ export const register: Register = on => {
         ? [<Box key="empty" paddingLeft={2}><Text dimColor>No files touched yet.</Text></Box>]
         : rows(tree, [false])
     // ponytail: the fade is redraws on a timer (ten a second at most); a Client module if it ever looks choppy.
-    if (flashing) $.clock.after(100, () => $.ui.invalidate('ui.render'))
+    // The timer comes from the data, not from the rows that happen to draw a flash: the Runs rows are built after
+    // this line. Each live event shows on exactly one row, so "the newest event is under FADE ms old" is the same
+    // as "a row flashes". Each draw cancels the waiting timer and arms a new one: so there is one timer at a time (a
+    // state write during a flash must not start another chain), and a timer that never fired (a hook refused it) is
+    // replaced by the next draw instead of blocking the fade for good.
+    const ended = lastEnded(log)
+    const newest = Math.max(tree.last?.at ?? -Infinity, ended ? endOf(ended) : -Infinity)
+    redraw?.cancel()
+    redraw =
+      now - newest >= 0 && now - newest < FADE ? $.clock.after(100, () => $.ui.invalidate('ui.render')) : undefined
 
     return (
       <Box flexDirection="column">

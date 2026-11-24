@@ -28,7 +28,9 @@ Each section has a header row with a `+` or `-` (boxed on the desktop). A press 
 
 An open Runs section shows one row for each program: `git`, `npm`, `rm` and so on. The mod takes the program from the first word of the command, after any `cd x &&`, `NAME=value` words and wrappers such as `sudo` and `env`. A group row shows the count and a mark for its worst status. A press on a group row opens it.
 
-An open group shows one entry for each execution, newest first. An entry shows a status mark, the whole stored command line and the duration. A long command wraps, and its line breaks stay. The marks are `●` ok, `✕` failed, `◌` background and `■` interrupted. A press on the mark of an entry that has output shows or hides the last 1000 characters of that output. For a failed command, the output holds the exit code line. A background command and a `Monitor` have no output to show.
+An open group shows one entry for each execution, newest first. An entry shows a status mark, the whole stored command line and the duration. A long command wraps, and its line breaks stay. The marks are `●` ok, `✕` failed, `◌` background and `■` interrupted. A press on the mark of an entry that has output shows or hides the last 1000 characters of that output. For a failed command, the output holds the exit code line. A background command and a `Monitor` have no output to show. The mark and the duration sit on the first line of a command that wraps.
+
+When a command ends, the row that shows it flashes and fades within 3 seconds, as a changed file does (a background command flashes when it starts, because its end is never seen): the entry when its group is open, else the group row, else the Runs header. The flash is green for ok, red for failed and amber for background and interrupted. Where a flash is at full strength, its status-colored text turns white for a moment.
 
 ## How it works
 
