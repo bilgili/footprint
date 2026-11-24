@@ -8,13 +8,101 @@ Footprint is a mod for Claude Code. It adds a pane with two sections. The Files 
 
 ## Install
 
-Type this at the prompt of a Claude Code session:
+Footprint is a Claude Code plugin. Its GitHub repository, `bilgili/footprint`, is also its plugin marketplace. Footprint runs in the Claude Code desktop app and in the terminal. Opening a file from the pane works only in the desktop app.
+
+### From a Claude Code session
+
+Type this at the prompt:
 
 ```
 /plugin install footprint --marketplace bilgili/footprint
 ```
 
-Answer `y` to add the marketplace, then pick a scope. The pane opens with the next session on the desktop app. In the terminal, or after a close, type `/footprint`.
+1. Answer `y` to add the `footprint` marketplace.
+2. Pick a scope. See [Scope](#scope).
+3. Restart Claude Code. A plugin loads when a session starts.
+
+### From a shell
+
+```bash
+claude plugin install footprint --marketplace bilgili/footprint
+```
+
+This command adds the marketplace when it is missing, and installs Footprint for your user. To do the two steps one at a time:
+
+```bash
+claude plugin marketplace add bilgili/footprint
+```
+
+```bash
+claude plugin install footprint@footprint
+```
+
+Restart Claude Code after the install.
+
+### Scope
+
+| Scope | Flag | Footprint is enabled for |
+|---|---|---|
+| user (default) | `-s user` | you, in every project on this machine |
+| project | `-s project` | everyone who uses the shared settings of this project |
+| local | `-s local` | you, in this project only |
+
+Add the flag to the install command, for example `claude plugin install footprint@footprint -s project`.
+
+### Check the install
+
+```bash
+claude plugin list
+```
+
+The list shows `footprint@footprint`, its version and `Status: ✔ enabled`.
+
+Start a session. In the desktop app, the Footprint pane opens by itself. In the terminal, type `/footprint` to open it. To open the pane again after you close it, type `/footprint`.
+
+### Update
+
+First refresh the marketplace catalog, then update the plugin:
+
+```bash
+claude plugin marketplace update footprint
+```
+
+```bash
+claude plugin update footprint@footprint
+```
+
+Restart Claude Code to load the new version. Claude Code compares version numbers. If it reports the latest version, no newer release exists.
+
+### Disable or remove
+
+To turn Footprint off but keep it installed:
+
+```bash
+claude plugin disable footprint@footprint
+```
+
+To turn it on again, use `claude plugin enable footprint@footprint`.
+
+To remove Footprint:
+
+```bash
+claude plugin uninstall footprint@footprint
+```
+
+If you installed Footprint with `-s project` or `-s local`, add the same flag, for example `claude plugin uninstall footprint@footprint -s project`.
+
+To remove the marketplace too:
+
+```bash
+claude plugin marketplace remove footprint
+```
+
+### Troubleshooting
+
+- The pane does not open: type `/footprint`. In the terminal, the pane does not open by itself.
+- After an update, the pane does not change: restart Claude Code, then type `/footprint`.
+- `/footprint` is not a known command: run `claude plugin list`. If Footprint is not in the list, install it. If its status is not enabled, enable it. Then restart Claude Code.
 
 ## What it shows
 
@@ -49,7 +137,7 @@ A separate log feeds the Runs section. A hook wraps each `Bash` call and each `M
 - Background Bash calls are not tracked.
 - A same-size rewrite inside the file system's mtime resolution is missed.
 - `/clear` and `--resume` start an empty ledger.
-- The pane works on the desktop app and in the terminal; the press-to-open needs the desktop app.
+- The pane works on the desktop app and in the terminal. Opening a file from the pane works only in the desktop app.
 - The duration of a run is the wall time of the call. It includes the time that you spend on a permission prompt.
 - The tool result has no exit code. A run shows `failed` when the call reports an error, and its output shows the exit code line.
 - A background command and a `Monitor` stay `background`. The log gets no later update and no output for them.
@@ -61,10 +149,41 @@ A separate log feeds the Runs section. A hook wraps each `Bash` call and each `M
 
 ## Develop
 
-```
+Check the manifest and run the tests from a clone:
+
+```bash
 claude plugin validate .
+```
+
+```bash
 claude plugin test .
 ```
+
+To try a clone in Claude Code, use the clone as the marketplace. The GitHub marketplace and the clone have the same name, `footprint`, so remove the GitHub marketplace first. This removes it from all your scopes. When you finish, install from GitHub again:
+
+```bash
+claude plugin marketplace remove footprint
+```
+
+```bash
+claude plugin marketplace add /path/to/your/footprint/clone
+```
+
+```bash
+claude plugin install footprint@footprint
+```
+
+Claude Code runs a copy of the plugin from its cache, one folder for each version. An edit in the clone does not reach that copy. To load an edit, raise `version` in `.claude-plugin/plugin.json`, then run:
+
+```bash
+claude plugin marketplace update footprint
+```
+
+```bash
+claude plugin update footprint@footprint
+```
+
+Then restart Claude Code. For most work, `claude plugin test .` is faster: it runs the hooks module from the clone, with no install.
 
 ## License
 
